@@ -1,6 +1,6 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Activity, RefreshCw, Search } from 'lucide-react';
+import { Activity, BarChart3, RefreshCw, Search } from 'lucide-react';
 import { decisionSignalsApi } from '../api/decisionSignals';
 import { getParsedApiError, type ParsedApiError } from '../api/error';
 import {
@@ -18,20 +18,32 @@ import {
   DecisionSignalCard,
   DecisionSignalDetails,
 } from '../components/decision-signals/DecisionSignalDisplay';
+import { DecisionSignalTimeline } from '../components/decision-signals/DecisionSignalTimeline';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
 import type { UiTextKey } from '../i18n/uiText';
 import type { DecisionAction, MarketPhaseValue } from '../types/analysis';
 import type {
   DecisionSignalItem,
+  DecisionSignalFeedbackItem,
+  DecisionSignalFeedbackValue,
   DecisionSignalListParams,
   DecisionSignalMarket,
+  DecisionSignalOutcomeItem,
+  DecisionSignalOutcomeStatsResponse,
   DecisionSignalSourceType,
   DecisionSignalStatus,
 } from '../types/decisionSignals';
 import { cn } from '../utils/cn';
 import { buildDecisionActionLabelMap } from '../utils/decisionAction';
+import {
+  getDecisionSignalMarketLabel,
+  getDecisionSignalMarketPhaseLabel,
+  getDecisionSignalSourceTypeLabel,
+} from '../utils/decisionSignalLabels';
 
 const PAGE_SIZE = 20;
+const TIMELINE_PAGE_SIZE = 100;
+const DAY_MS = 86400_000;
 
 type ListFilters = {
   market: '' | DecisionSignalMarket;
@@ -39,7 +51,18 @@ type ListFilters = {
   action: '' | DecisionAction;
   marketPhase: '' | MarketPhaseValue;
   sourceType: '' | DecisionSignalSourceType;
+  sourceReportId: string;
   status: '' | DecisionSignalStatus;
+};
+
+type TimelineRange = '30d' | '90d' | '180d';
+type TimelineStatusFilter = 'all' | 'active';
+
+type TimelineFilters = {
+  market: '' | DecisionSignalMarket;
+  stockCode: string;
+  range: TimelineRange;
+  status: TimelineStatusFilter;
 };
 
 type PendingStatusChange = {
@@ -50,10 +73,10 @@ type PendingStatusChange = {
 
 type SelectedSignal = {
   item: DecisionSignalItem;
-  source: 'list' | 'latest';
+  source: 'list' | 'latest' | 'timeline';
 };
 
-const MARKET_OPTIONS: DecisionSignalMarket[] = ['cn', 'hk', 'us'];
+const MARKET_OPTIONS: DecisionSignalMarket[] = ['cn', 'hk', 'us', 'jp', 'kr', 'tw'];
 const ACTION_OPTIONS: DecisionAction[] = ['buy', 'add', 'hold', 'reduce', 'sell', 'watch', 'avoid', 'alert'];
 const PHASE_OPTIONS: MarketPhaseValue[] = ['premarket', 'intraday', 'lunch_break', 'closing_auction', 'postmarket', 'non_trading', 'unknown'];
 const SOURCE_OPTIONS: DecisionSignalSourceType[] = ['analysis', 'agent', 'alert', 'market_review', 'manual'];
@@ -81,7 +104,57 @@ const STATUS_ACTION_CONFIRM_KEYS: Record<PendingStatusChange['status'], UiTextKe
   archived: 'decisionSignals.archiveConfirm',
 };
 
+const DEFAULT_LIST_FILTERS: ListFilters = {
+  market: '',
+  stockCode: '',
+  action: '',
+  marketPhase: '',
+  sourceType: '',
+  sourceReportId: '',
+  status: 'active',
+};
+
+const DEFAULT_TIMELINE_FILTERS: TimelineFilters = {
+  market: '',
+  stockCode: '',
+  range: '90d',
+  status: 'all',
+};
+
+const TIMELINE_RANGE_DAYS: Record<TimelineRange, number> = {
+  '30d': 30,
+  '90d': 90,
+  '180d': 180,
+};
+
+function parseSourceReportId(value: string): number | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  const parsed = Number(trimmed);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function getInitialFilters(search = typeof window === 'undefined' ? '' : window.location.search): ListFilters {
+  const params = new URLSearchParams(search);
+  const sourceReportId = parseSourceReportId(params.get('sourceReportId') ?? params.get('source_report_id') ?? '');
+  if (sourceReportId === undefined) return DEFAULT_LIST_FILTERS;
+  return {
+    ...DEFAULT_LIST_FILTERS,
+    sourceReportId: String(sourceReportId),
+  };
+}
+
 function toListParams(filters: ListFilters, page: number): DecisionSignalListParams {
+  const sourceReportId = parseSourceReportId(filters.sourceReportId);
+  if (sourceReportId !== undefined) {
+    return {
+      sourceReportId,
+      sourceType: 'analysis',
+      page,
+      pageSize: PAGE_SIZE,
+    };
+  }
+
   return {
     market: filters.market || undefined,
     stockCode: filters.stockCode.trim() || undefined,
@@ -103,18 +176,45 @@ function refreshLatestSelection(
   return refreshed ? { source: 'latest', item: refreshed } : null;
 }
 
+function refreshTimelineSelection(
+  current: SelectedSignal | null,
+  timelineItems: DecisionSignalItem[],
+): SelectedSignal | null {
+  if (!current || current.source !== 'timeline') return current;
+  const refreshed = timelineItems.find((item) => item.id === current.item.id);
+  return refreshed ? { source: 'timeline', item: refreshed } : null;
+}
+
+function toTimelineParams(filters: TimelineFilters): DecisionSignalListParams {
+  const days = TIMELINE_RANGE_DAYS[filters.range];
+  const createdTo = new Date();
+  const createdFrom = new Date(createdTo.getTime() - days * DAY_MS);
+  return {
+    market: filters.market || undefined,
+    stockCode: filters.stockCode.trim(),
+    createdFrom: createdFrom.toISOString(),
+    createdTo: createdTo.toISOString(),
+    status: filters.status === 'active' ? 'active' : undefined,
+    page: 1,
+    pageSize: TIMELINE_PAGE_SIZE,
+  };
+}
+
+function formatStatNumber(value: number | null | undefined): string {
+  if (value === null || value === undefined || Number.isNaN(value)) return '-';
+  return Number(value).toFixed(2).replace(/\.?0+$/, '');
+}
+
+function formatStatPercent(value: number | null | undefined): string {
+  const formatted = formatStatNumber(value);
+  return formatted === '-' ? formatted : `${formatted}%`;
+}
+
 const DecisionSignalsPage: React.FC = () => {
   const { t } = useUiLanguage();
   const actionLabels = useMemo(() => buildDecisionActionLabelMap(t), [t]);
-  const [filters, setFilters] = useState<ListFilters>({
-    market: '',
-    stockCode: '',
-    action: '',
-    marketPhase: '',
-    sourceType: '',
-    status: 'active',
-  });
-  const [appliedFilters, setAppliedFilters] = useState<ListFilters>(filters);
+  const [filters, setFilters] = useState<ListFilters>(() => getInitialFilters());
+  const [appliedFilters, setAppliedFilters] = useState<ListFilters>(() => getInitialFilters());
   const [page, setPage] = useState(1);
   const [items, setItems] = useState<DecisionSignalItem[]>([]);
   const [total, setTotal] = useState(0);
@@ -123,13 +223,34 @@ const DecisionSignalsPage: React.FC = () => {
   const [selected, setSelected] = useState<SelectedSignal | null>(null);
   const [pendingStatus, setPendingStatus] = useState<PendingStatusChange | null>(null);
   const [statusUpdating, setStatusUpdating] = useState(false);
+  const [outcomeStats, setOutcomeStats] = useState<DecisionSignalOutcomeStatsResponse | null>(null);
+  const [statsLoading, setStatsLoading] = useState(true);
+  const [statsError, setStatsError] = useState<ParsedApiError | null>(null);
   const [latestStockCode, setLatestStockCode] = useState('');
   const [latestItems, setLatestItems] = useState<DecisionSignalItem[]>([]);
   const [latestSearched, setLatestSearched] = useState(false);
   const [latestLoading, setLatestLoading] = useState(false);
   const [latestError, setLatestError] = useState<ParsedApiError | null>(null);
+  const [timelineFilters, setTimelineFilters] = useState<TimelineFilters>(DEFAULT_TIMELINE_FILTERS);
+  const [appliedTimelineFilters, setAppliedTimelineFilters] = useState<TimelineFilters>(DEFAULT_TIMELINE_FILTERS);
+  const [timelineItems, setTimelineItems] = useState<DecisionSignalItem[]>([]);
+  const [timelineSearched, setTimelineSearched] = useState(false);
+  const [timelineLoading, setTimelineLoading] = useState(false);
+  const [timelineError, setTimelineError] = useState<ParsedApiError | null>(null);
+  const [timelineTruncated, setTimelineTruncated] = useState(false);
+  const [selectedOutcomes, setSelectedOutcomes] = useState<DecisionSignalOutcomeItem[]>([]);
+  const [selectedOutcomesLoading, setSelectedOutcomesLoading] = useState(false);
+  const [selectedOutcomesError, setSelectedOutcomesError] = useState<ParsedApiError | null>(null);
+  const [selectedFeedback, setSelectedFeedback] = useState<DecisionSignalFeedbackItem | null>(null);
+  const [selectedFeedbackLoading, setSelectedFeedbackLoading] = useState(false);
+  const [selectedFeedbackError, setSelectedFeedbackError] = useState<ParsedApiError | null>(null);
+  const [feedbackSaving, setFeedbackSaving] = useState(false);
   const requestIdRef = useRef(0);
+  const statsRequestIdRef = useRef(0);
   const latestRequestIdRef = useRef(0);
+  const timelineRequestIdRef = useRef(0);
+  const detailRequestIdRef = useRef(0);
+  const selectedSignalIdRef = useRef<number | null>(null);
   const statusUpdateInFlightRef = useRef(false);
 
   useEffect(() => {
@@ -174,6 +295,26 @@ const DecisionSignalsPage: React.FC = () => {
     await loadSignalsForPage(page);
   }, [loadSignalsForPage, page]);
 
+  const loadOutcomeStats = useCallback(async () => {
+    const requestId = statsRequestIdRef.current + 1;
+    statsRequestIdRef.current = requestId;
+    setStatsLoading(true);
+    try {
+      const response = await decisionSignalsApi.getOutcomeStats();
+      if (statsRequestIdRef.current !== requestId) return;
+      setOutcomeStats(response);
+      setStatsError(null);
+    } catch (err) {
+      if (statsRequestIdRef.current !== requestId) return;
+      setOutcomeStats(null);
+      setStatsError(getParsedApiError(err));
+    } finally {
+      if (statsRequestIdRef.current === requestId) {
+        setStatsLoading(false);
+      }
+    }
+  }, []);
+
   useEffect(() => {
     void loadSignals();
     return () => {
@@ -181,9 +322,73 @@ const DecisionSignalsPage: React.FC = () => {
     };
   }, [loadSignals]);
 
+  useEffect(() => {
+    void loadOutcomeStats();
+    return () => {
+      statsRequestIdRef.current += 1;
+    };
+  }, [loadOutcomeStats]);
+
   useEffect(() => () => {
     latestRequestIdRef.current += 1;
   }, []);
+
+  useEffect(() => () => {
+    timelineRequestIdRef.current += 1;
+  }, []);
+
+  useEffect(() => {
+    selectedSignalIdRef.current = selected?.item.id ?? null;
+    if (!selected) {
+      detailRequestIdRef.current += 1;
+      setSelectedOutcomes([]);
+      setSelectedOutcomesError(null);
+      setSelectedFeedback(null);
+      setSelectedFeedbackError(null);
+      setSelectedOutcomesLoading(false);
+      setSelectedFeedbackLoading(false);
+      return;
+    }
+
+    const requestId = detailRequestIdRef.current + 1;
+    detailRequestIdRef.current = requestId;
+    setSelectedOutcomesLoading(true);
+    setSelectedFeedbackLoading(true);
+    setSelectedOutcomesError(null);
+    setSelectedFeedbackError(null);
+
+    void decisionSignalsApi.getSignalOutcomes(selected.item.id)
+      .then((response) => {
+        if (detailRequestIdRef.current !== requestId) return;
+        setSelectedOutcomes(response.items);
+      })
+      .catch((err) => {
+        if (detailRequestIdRef.current !== requestId) return;
+        setSelectedOutcomes([]);
+        setSelectedOutcomesError(getParsedApiError(err));
+      })
+      .finally(() => {
+        if (detailRequestIdRef.current === requestId) {
+          setSelectedOutcomesLoading(false);
+        }
+      });
+
+    void decisionSignalsApi.getFeedback(selected.item.id)
+      .then((response) => {
+        if (detailRequestIdRef.current !== requestId) return;
+        setSelectedFeedback(response);
+      })
+      .catch((err) => {
+        if (detailRequestIdRef.current !== requestId) return;
+        setSelectedFeedback(null);
+        setSelectedFeedbackError(getParsedApiError(err));
+      })
+      .finally(() => {
+        if (detailRequestIdRef.current === requestId) {
+          setSelectedFeedbackLoading(false);
+        }
+      });
+  }, [selected]);
 
   const handleApplyFilters = (event: React.FormEvent) => {
     event.preventDefault();
@@ -220,6 +425,49 @@ const DecisionSignalsPage: React.FC = () => {
     }
   };
 
+  const resetTimelineView = useCallback(() => {
+    timelineRequestIdRef.current += 1;
+    setTimelineItems([]);
+    setTimelineSearched(false);
+    setTimelineLoading(false);
+    setTimelineError(null);
+    setTimelineTruncated(false);
+    setSelected((current) => (current?.source === 'timeline' ? null : current));
+  }, []);
+
+  const handleTimelineSearch = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const stockCode = timelineFilters.stockCode.trim();
+    if (!stockCode) return;
+    const requestId = timelineRequestIdRef.current + 1;
+    timelineRequestIdRef.current = requestId;
+    setTimelineLoading(true);
+    setTimelineError(null);
+    setTimelineSearched(true);
+    const nextAppliedFilters = {
+      ...timelineFilters,
+      stockCode,
+    };
+    try {
+      const response = await decisionSignalsApi.list(toTimelineParams(nextAppliedFilters));
+      if (timelineRequestIdRef.current !== requestId) return;
+      setAppliedTimelineFilters(nextAppliedFilters);
+      setTimelineItems(response.items);
+      setTimelineTruncated(response.total > response.items.length);
+      setSelected((current) => refreshTimelineSelection(current, response.items));
+    } catch (err) {
+      if (timelineRequestIdRef.current !== requestId) return;
+      setTimelineItems([]);
+      setTimelineTruncated(false);
+      setSelected((current) => refreshTimelineSelection(current, []));
+      setTimelineError(getParsedApiError(err));
+    } finally {
+      if (timelineRequestIdRef.current === requestId) {
+        setTimelineLoading(false);
+      }
+    }
+  };
+
   const handleStatusUpdate = async () => {
     if (!pendingStatus || statusUpdateInFlightRef.current) return;
     statusUpdateInFlightRef.current = true;
@@ -233,16 +481,26 @@ const DecisionSignalsPage: React.FC = () => {
         if (item.id !== updated.id) return [item];
         return updated.status === 'active' ? [updated] : [];
       }));
+      setTimelineItems((current) => current.flatMap((item) => {
+        if (item.id !== updated.id) return [item];
+        return appliedTimelineFilters.status === 'active' && updated.status !== 'active' ? [] : [updated];
+      }));
       setSelected((current) => {
         if (!current || current.item.id !== updated.id) return current;
         if (current.source === 'latest') {
           return updated.status === 'active' ? { source: 'latest', item: updated } : null;
         }
-        if (appliedFilters.status && updated.status !== appliedFilters.status) return null;
+        if (current.source === 'timeline') {
+          return appliedTimelineFilters.status === 'active' && updated.status !== 'active'
+            ? null
+            : { source: 'timeline', item: updated };
+        }
+        if (!parseSourceReportId(appliedFilters.sourceReportId) && appliedFilters.status && updated.status !== appliedFilters.status) return null;
         return { source: 'list', item: updated };
       });
       setError(null);
       await loadSignalsForPage(page);
+      await loadOutcomeStats();
     } catch (err) {
       setError(getParsedApiError(err));
       setPendingStatus(null);
@@ -251,6 +509,26 @@ const DecisionSignalsPage: React.FC = () => {
       statusUpdateInFlightRef.current = false;
     }
   };
+
+  const handleFeedbackSubmit = useCallback(async (feedbackValue: DecisionSignalFeedbackValue) => {
+    if (!selected || feedbackSaving) return;
+    const signalId = selected.item.id;
+    setFeedbackSaving(true);
+    try {
+      const updated = await decisionSignalsApi.putFeedback(signalId, {
+        feedbackValue,
+        source: 'web',
+      });
+      if (selectedSignalIdRef.current !== signalId) return;
+      setSelectedFeedback(updated);
+      setSelectedFeedbackError(null);
+    } catch (err) {
+      if (selectedSignalIdRef.current !== signalId) return;
+      setSelectedFeedbackError(getParsedApiError(err));
+    } finally {
+      setFeedbackSaving(false);
+    }
+  }, [feedbackSaving, selected]);
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
@@ -265,7 +543,10 @@ const DecisionSignalsPage: React.FC = () => {
             <button
               type="button"
               className="btn-secondary inline-flex items-center gap-2"
-              onClick={() => void loadSignals()}
+              onClick={() => {
+                void loadSignals();
+                void loadOutcomeStats();
+              }}
               disabled={loading}
             >
               <RefreshCw className={cn('h-4 w-4', loading ? 'animate-spin' : '')} />
@@ -275,7 +556,7 @@ const DecisionSignalsPage: React.FC = () => {
         />
 
         <Card padding="md">
-          <form className="grid gap-3 md:grid-cols-3 xl:grid-cols-6" onSubmit={handleApplyFilters}>
+          <form className="grid gap-3 md:grid-cols-3 xl:grid-cols-7" onSubmit={handleApplyFilters}>
             <select
               className="input-surface input-focus-glow h-11 rounded-xl border bg-transparent px-3 text-sm"
               value={filters.market}
@@ -284,7 +565,7 @@ const DecisionSignalsPage: React.FC = () => {
             >
               <option value="">{t('decisionSignals.allMarkets')}</option>
               {MARKET_OPTIONS.map((market) => (
-                <option key={market} value={market}>{t(`decisionSignals.market.${market}` as UiTextKey)}</option>
+                <option key={market} value={market}>{getDecisionSignalMarketLabel(market, t)}</option>
               ))}
             </select>
             <input
@@ -312,7 +593,9 @@ const DecisionSignalsPage: React.FC = () => {
               aria-label={t('decisionSignals.marketPhase')}
             >
               <option value="">{t('decisionSignals.allPhases')}</option>
-              {PHASE_OPTIONS.map((phase) => <option key={phase} value={phase}>{phase}</option>)}
+              {PHASE_OPTIONS.map((phase) => (
+                <option key={phase} value={phase}>{getDecisionSignalMarketPhaseLabel(phase, t)}</option>
+              ))}
             </select>
             <select
               className="input-surface input-focus-glow h-11 rounded-xl border bg-transparent px-3 text-sm"
@@ -321,8 +604,21 @@ const DecisionSignalsPage: React.FC = () => {
               aria-label={t('decisionSignals.source')}
             >
               <option value="">{t('decisionSignals.allSources')}</option>
-              {SOURCE_OPTIONS.map((source) => <option key={source} value={source}>{source}</option>)}
+              {SOURCE_OPTIONS.map((source) => (
+                <option key={source} value={source}>{getDecisionSignalSourceTypeLabel(source, t)}</option>
+              ))}
             </select>
+            <input
+              className="input-surface input-focus-glow h-11 rounded-xl border bg-transparent px-3 text-sm"
+              value={filters.sourceReportId}
+              onChange={(event) => setFilters((current) => ({ ...current, sourceReportId: event.target.value }))}
+              placeholder={t('decisionSignals.sourceReportId')}
+              aria-label={t('decisionSignals.sourceReportId')}
+              inputMode="numeric"
+              min={1}
+              step={1}
+              type="number"
+            />
             <select
               className="input-surface input-focus-glow h-11 rounded-xl border bg-transparent px-3 text-sm"
               value={filters.status}
@@ -332,11 +628,53 @@ const DecisionSignalsPage: React.FC = () => {
               <option value="">{t('decisionSignals.allStatuses')}</option>
               {STATUS_OPTIONS.map((status) => <option key={status} value={status}>{t(STATUS_LABEL_KEYS[status])}</option>)}
             </select>
-            <button type="submit" className="btn-primary inline-flex h-11 items-center justify-center gap-2 xl:col-start-6">
+            <button type="submit" className="btn-primary inline-flex h-11 items-center justify-center gap-2">
               <Search className="h-4 w-4" />
               {t('decisionSignals.filter')}
             </button>
           </form>
+        </Card>
+
+        <Card title={t('decisionSignals.statsTitle')} subtitle={t('decisionSignals.statsDescription')} padding="md">
+          {statsError ? (
+            <ApiErrorAlert
+              error={{ ...statsError, title: t('decisionSignals.statsErrorTitle') }}
+              actionLabel={t('common.retry')}
+              onAction={() => void loadOutcomeStats()}
+            />
+          ) : statsLoading ? (
+            <p className="text-sm text-secondary-text">{t('common.loading')}...</p>
+          ) : outcomeStats ? (
+            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+              <div className="rounded-xl border border-border/60 bg-elevated/40 px-3 py-3">
+                <p className="text-xs text-secondary-text">{t('decisionSignals.statsTotal')}</p>
+                <p className="mt-1 text-2xl font-semibold text-foreground">{outcomeStats.total}</p>
+              </div>
+              <div className="rounded-xl border border-border/60 bg-elevated/40 px-3 py-3">
+                <p className="text-xs text-secondary-text">{t('decisionSignals.statsHitRate')}</p>
+                <p className="mt-1 text-2xl font-semibold text-success">{formatStatPercent(outcomeStats.hitRatePct)}</p>
+              </div>
+              <div className="rounded-xl border border-border/60 bg-elevated/40 px-3 py-3">
+                <p className="text-xs text-secondary-text">{t('decisionSignals.outcome.hit')}</p>
+                <p className="mt-1 text-2xl font-semibold text-success">{outcomeStats.hit}</p>
+              </div>
+              <div className="rounded-xl border border-border/60 bg-elevated/40 px-3 py-3">
+                <p className="text-xs text-secondary-text">{t('decisionSignals.outcome.miss')}</p>
+                <p className="mt-1 text-2xl font-semibold text-danger">{outcomeStats.miss}</p>
+              </div>
+              <div className="rounded-xl border border-border/60 bg-elevated/40 px-3 py-3">
+                <p className="text-xs text-secondary-text">{t('decisionSignals.outcome.unable')}</p>
+                <p className="mt-1 text-2xl font-semibold text-warning">{outcomeStats.unable}</p>
+              </div>
+            </div>
+          ) : (
+            <EmptyState
+              className="border-none bg-transparent py-6 shadow-none"
+              title={t('decisionSignals.noStatsTitle')}
+              description={t('decisionSignals.noStatsDescription')}
+              icon={<BarChart3 className="h-6 w-6" />}
+            />
+          )}
         </Card>
 
         <Card title={t('decisionSignals.latestTitle')} subtitle={t('decisionSignals.latestDescription')} padding="md">
@@ -374,6 +712,81 @@ const DecisionSignalsPage: React.FC = () => {
               ))}
             </div>
           ) : null}
+        </Card>
+
+        <Card title={t('decisionSignals.timelineTitle')} subtitle={t('decisionSignals.timelineDescription')} padding="md">
+          <form className="grid gap-3 md:grid-cols-5" onSubmit={handleTimelineSearch}>
+            <select
+              className="input-surface input-focus-glow h-11 rounded-xl border bg-transparent px-3 text-sm"
+              value={timelineFilters.market}
+              onChange={(event) => setTimelineFilters((current) => ({ ...current, market: event.target.value as TimelineFilters['market'] }))}
+              aria-label={t('decisionSignals.timelineMarket')}
+            >
+              <option value="">{t('decisionSignals.allMarkets')}</option>
+              {MARKET_OPTIONS.map((market) => (
+                <option key={market} value={market}>{getDecisionSignalMarketLabel(market, t)}</option>
+              ))}
+            </select>
+            <input
+              className="input-surface input-focus-glow h-11 rounded-xl border bg-transparent px-3 text-sm md:col-span-2"
+              value={timelineFilters.stockCode}
+              onChange={(event) => {
+                const stockCode = event.target.value;
+                setTimelineFilters((current) => ({ ...current, stockCode }));
+                if (!stockCode.trim()) {
+                  resetTimelineView();
+                }
+              }}
+              placeholder={t('decisionSignals.timelineStockPlaceholder')}
+              aria-label={t('decisionSignals.timelineStockCode')}
+            />
+            <select
+              className="input-surface input-focus-glow h-11 rounded-xl border bg-transparent px-3 text-sm"
+              value={timelineFilters.range}
+              onChange={(event) => setTimelineFilters((current) => ({ ...current, range: event.target.value as TimelineRange }))}
+              aria-label={t('decisionSignals.timelineRange')}
+            >
+              <option value="30d">{t('decisionSignals.timelineRange.30d')}</option>
+              <option value="90d">{t('decisionSignals.timelineRange.90d')}</option>
+              <option value="180d">{t('decisionSignals.timelineRange.180d')}</option>
+            </select>
+            <select
+              className="input-surface input-focus-glow h-11 rounded-xl border bg-transparent px-3 text-sm"
+              value={timelineFilters.status}
+              onChange={(event) => setTimelineFilters((current) => ({ ...current, status: event.target.value as TimelineStatusFilter }))}
+              aria-label={t('decisionSignals.timelineStatus')}
+            >
+              <option value="all">{t('decisionSignals.timelineStatus.all')}</option>
+              <option value="active">{t('decisionSignals.timelineStatus.active')}</option>
+            </select>
+            <button
+              type="submit"
+              className="btn-secondary inline-flex h-11 items-center justify-center gap-2 md:col-start-5"
+              disabled={timelineLoading || !timelineFilters.stockCode.trim()}
+            >
+              <Search className="h-4 w-4" />
+              {t('decisionSignals.timelineSearch')}
+            </button>
+          </form>
+          <div className="mt-4">
+            {!timelineSearched ? (
+              <EmptyState
+                className="border-none bg-transparent py-6 shadow-none"
+                title={t('decisionSignals.timelineGuideTitle')}
+                description={t('decisionSignals.timelineGuideDescription')}
+                icon={<Activity className="h-6 w-6" />}
+              />
+            ) : (
+              <DecisionSignalTimeline
+                items={timelineItems}
+                selectedId={selected?.item.id ?? null}
+                loading={timelineLoading}
+                error={timelineError?.message ?? null}
+                truncated={timelineTruncated}
+                onSelect={(selectedItem) => setSelected({ source: 'timeline', item: selectedItem })}
+              />
+            )}
+          </div>
         </Card>
 
         {error ? (
@@ -420,6 +833,14 @@ const DecisionSignalsPage: React.FC = () => {
         {selected ? (
           <DecisionSignalDetails
             item={selected.item}
+            outcomes={selectedOutcomes}
+            outcomesLoading={selectedOutcomesLoading}
+            outcomesError={selectedOutcomesError?.message ?? null}
+            feedback={selectedFeedback}
+            feedbackLoading={selectedFeedbackLoading}
+            feedbackSaving={feedbackSaving}
+            feedbackError={selectedFeedbackError?.message ?? null}
+            onFeedbackSubmit={handleFeedbackSubmit}
             actions={STATUS_ACTIONS.map((status) => (
               <button
                 key={status}
